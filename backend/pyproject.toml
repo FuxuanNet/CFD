@@ -1,0 +1,25 @@
+[project]
+name = "cae-demo-backend"
+version = "0.1.0"
+description = "FastAPI backend skeleton for a minimal cloud CAE demo."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic-settings",
+    "python-multipart",
+    "gmsh",
+    "meshio",
+    "numpy",
+    "scipy",
+    "vtk",
+    "pyvista",
+]
+
+[dependency-groups]
+dev = [
+    "httpx",
+    "pytest",
+]
+
