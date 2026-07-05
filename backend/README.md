@@ -1,16 +1,16 @@
-# CAE Demo Backend
+# YiYaoFlow 后端
 
-FastAPI backend for the minimal cloud CAE demo. It runs the current solid-analysis flow:
+本目录是 YiYaoFlow 的 FastAPI 后端，负责几何、网格、前处理、求解器插件、结果转换、任务状态和受控文件访问。
+
+后端的主流程为：
 
 ```text
-geometry -> repaired mesh -> material/node selections/load -> CalculiX solve -> VTK result files
+geometry -> mesh -> preprocess -> solver plugin -> results -> controlled file API
 ```
 
-The current backend also includes a minimal structural solver plugin system. The UI no longer hardcodes a single solver name; it asks the backend for available structural solvers and sends the chosen `solver_plugin_id` when starting a solve.
+## 环境准备
 
-The API keeps generated artifacts in `app/workspace/{job_id}/`, but clients must not read that directory directly. File access goes through the controlled files API described below.
-
-## Environment With uv
+后端使用 `uv` 管理 Python 环境，要求 Python `>=3.11`。
 
 ```powershell
 cd backend
@@ -18,36 +18,113 @@ uv python pin 3.11
 uv sync
 ```
 
-The project uses `gmsh`, `meshio`, `numpy`, `vtk`, and `pyvista`. CalculiX is an external command line solver and is not installed by uv.
+Python 依赖包括 FastAPI、Gmsh、meshio、NumPy、SciPy、VTK 和 PyVista。CalculiX 等求解器可执行文件不由 `uv` 安装，需要通过插件目录或环境变量单独提供。
 
-## CalculiX
+## 启动服务
 
-If `ccx` is available in `PATH`, no extra setting is needed. Otherwise point the backend to the executable:
+```powershell
+cd backend
+uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+健康检查：
+
+```text
+GET http://127.0.0.1:8000/api/health
+```
+
+FastAPI 文档页面：
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+## 配置项
+
+配置定义在 `app/core/config.py`，可通过环境变量覆盖。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `APP_NAME` | `Minimal Cloud CAE Demo Backend` | 应用名称 |
+| `API_PREFIX` | `/api` | API 前缀 |
+| `CORS_ORIGINS` | `http://localhost:5173`, `http://127.0.0.1:5173` | 前端跨域白名单 |
+| `CCX_EXECUTABLE` | 本机 CalculiX 示例路径 | CalculiX 回退可执行文件路径 |
+| `WORKSPACE_ROOT` | `backend/app/workspace` | 算例产物目录 |
+
+Windows PowerShell 示例：
 
 ```powershell
 $env:CCX_EXECUTABLE="E:\CalculiX-2.23.0-win-x64\bin\ccx.exe"
 ```
 
-Optional direct check:
+## 核心 API
 
-```powershell
-& "E:\CalculiX-2.23.0-win-x64\bin\ccx.exe"
-```
+| API | 说明 |
+| --- | --- |
+| `POST /api/geometry/box` | 创建长方体几何 |
+| `POST /api/geometry/sphere` | 创建球体几何 |
+| `POST /api/geometry/cylinder` | 创建圆柱体几何 |
+| `POST /api/geometry/step` | 导入 STEP/STP 几何 |
+| `POST /api/mesh/tasks` | 启动网格生成任务 |
+| `POST /api/preprocess/material` | 保存材料参数 |
+| `POST /api/preprocess/boundary` | 保存固定节点和自由度 |
+| `POST /api/preprocess/load` | 保存一个或多个载荷项 |
+| `GET /api/solver/plugins` | 获取可用求解器插件 |
+| `POST /api/solver/tasks` | 启动求解任务 |
+| `GET /api/tasks/{task_id}` | 查询任务状态和日志 |
+| `GET /api/results/{result_id}/summary` | 获取结果摘要 |
+| `GET /api/results/{result_id}/field?field=displacement\|von_mises` | 获取位移或应力云图文件 |
+| `GET /api/files/{job_id}/{stage}/{filename}` | 下载受控工作区文件 |
 
-## Structural Solver Plugin System
+任务接口会返回 `task_id`，前端按 `GET /api/tasks/{task_id}` 轮询 `status`、`progress`、`phase`、`message`、`logs`、`result` 和 `error`。
 
-The backend uses a minimal structural solver plugin system so the frontend does not hardcode one solver. Each plugin lives under `app/plugins/<PluginName>/` and contains a `plugin.yaml` plus a Python adapter class. Current example:
+## 工作区文件
+
+后端产物位于 `WORKSPACE_ROOT` 下，默认是：
 
 ```text
-app/plugins/
-  CalculiX/
-    plugin.yaml
-    adapter.py
-    bin/
-      ccx.exe
+backend/app/workspace/
+└── job_abcdef123456/
+    ├── geometry/
+    ├── mesh/
+    ├── preprocess/
+    ├── solver/
+    └── results/
 ```
 
-Example manifest:
+业务 API 返回 `FileReference`，其 `path` 是逻辑路径，例如：
+
+```text
+workspace/job_abcdef123456/results/result_surface_displacement.vtp
+```
+
+浏览器不能直接读取该路径，应通过受控文件 API 访问：
+
+```text
+GET /api/files/job_abcdef123456/results/result_surface_displacement.vtp
+```
+
+文件 API 会校验 `job_id`、阶段名、文件名白名单和路径边界，避免暴露任意本地文件。
+
+## 求解器插件
+
+后端启动时通过 `app/services/structural_plugins/manager.py` 扫描：
+
+```text
+backend/app/plugins/*/plugin.yaml
+```
+
+插件目录最小结构：
+
+```text
+backend/app/plugins/Calculix/
+├── plugin.yaml
+├── adapter.py
+└── bin/
+    └── ccx.exe
+```
+
+`plugin.yaml` 示例：
 
 ```yaml
 id: calculix
@@ -59,157 +136,45 @@ class: CalculiXPlugin
 executable: bin/ccx.exe
 ```
 
-How it works:
-
-1. `app/services/structural_plugins/manager.py` scans `app/plugins/*/plugin.yaml`, validates the manifest, loads the adapter module from `entry`, and resolves the adapter class from `class`.
-2. `GET /api/solver/plugins` returns the discovered plugin list to the frontend.
-3. The frontend sends the chosen `solver_plugin_id` in `POST /api/solver/run` or `POST /api/solver/tasks`.
-4. `app/api/solver_api.py` creates the plugin instance with `get_structural_solver_manager().create_plugin(request.solver_plugin_id)` and calls `solve(...)`.
-5. The current `CalculiXPlugin` is a thin adapter that delegates to the existing `run_static_solve(...)` pipeline.
-
-Current request flow:
-
-```text
-Frontend
-  -> GET /api/solver/plugins
-  -> user selects solver plugin id
-  -> POST /api/solver/tasks with solver_plugin_id
-  -> backend creates plugin instance
-  -> plugin.solve(request, emit)
-  -> existing static solve pipeline runs
-  -> result files returned as before
-```
-
-Executable resolution is also plugin-based: `run_static_solve` first uses the executable path declared in `plugin.yaml`, and falls back to `CCX_EXECUTABLE` if that file does not exist.
-
-To add a new structural solver, create a new directory under `app/plugins/`, add `plugin.yaml`, and implement an adapter class derived from `StructuralSolverPlugin`. This first version is intentionally minimal: each solver family still needs its own adapter, and the request shape is still focused on static structural analysis.
-
-Key call site:
+适配器类必须继承 `StructuralSolverPlugin` 并实现：
 
 ```python
-get_structural_solver_manager().create_plugin(request.solver_plugin_id).solve(...)
+def solve(self, request: SolverRunRequest, emit=None) -> SolverRunResponse:
+    ...
 ```
 
-## Run API Server
+当前仓库的 `.gitignore` 忽略 `backend/app/plugins/**`，因此开源克隆后可能没有任何求解器插件。需要先自行放置插件目录；如果 CalculiX 插件已注册但未携带 `ccx.exe`，再通过 `CCX_EXECUTABLE` 指向外部可执行文件。
 
-```powershell
-cd backend
-uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-```
+新增插件请参考 [../docs/如何新增求解器插件(1).md](../docs/如何新增求解器插件(1).md)。
 
-Health check:
+## 求解流程约束
 
-```text
-GET http://127.0.0.1:8000/api/health
-```
+- 当前结构求解流程面向静力分析。
+- 求解要求有效体网格；表面网格只用于预览。
+- `POST /api/solver/tasks` 必须传入 `solver_plugin_id`。
+- 多载荷项会写成多个节点集，并在同一个静力步中叠加。
+- 结果转换会输出 `result.vtu`、`result_surface_displacement.vtp`、`result_surface_von_mises.vtp` 和 `result_summary.json`。
 
-## API Flow
+## 本地检查
 
-All successful responses keep the current root-level shape, for example `success`, `message`, `geometry_id`, `mesh_id`, `files`, and so on. They are not wrapped in a `data` object.
-
-```text
-POST /api/geometry/box
-POST /api/geometry/step
-POST /api/mesh/generate
-POST /api/mesh/tasks
-POST /api/preprocess/material
-POST /api/preprocess/boundary
-POST /api/preprocess/load
-GET  /api/solver/plugins
-POST /api/solver/run
-POST /api/solver/tasks
-GET  /api/tasks/{task_id}
-GET  /api/results/{result_id}/summary
-GET  /api/results/{result_id}/field?field=displacement|von_mises
-```
-
-STEP import writes a real surface `geometry_preview.vtp` for browser rendering. Mesh generation tries raw STEP solid meshing first, then healed solid meshing, then surface-mesh fallback. This avoids damaging valid periodic solids such as `sphere_d10.0.step` during healing. If the STEP cannot form a closed volume, the backend still returns a displayable surface mesh with `mesh_kind="surface"` and `analysis_ready=false`.
-
-The current solver supports solid elements only. Surface-only or broken STEP models can be displayed and inspected, but they are not sent to CalculiX until they form a valid volume mesh.
-
-Long-running mesh and solver operations can also be run through task endpoints. `POST /api/mesh/tasks` and `POST /api/solver/tasks` return a `task_id`; poll `GET /api/tasks/{task_id}` for `status`, `progress`, `phase`, `message`, typed `logs`, `result`, and `error`. Log channels are `message`, `mesh`, `solver`, and `error`.
-
-Solver execution now requires `solver_plugin_id`, because the solver is chosen through the plugin manager instead of being hardcoded.
-
-Boundary setup uses explicit fixed mesh node selections:
-
-```json
-{
-  "mesh_id": "job_abcdef123456",
-  "node_ids": [1, 2, 3],
-  "dofs": [1, 2, 3]
-}
-```
-
-Load setup accepts either the legacy single-load shape or multiple force items in one static step:
-
-```json
-{
-  "mesh_id": "job_abcdef123456",
-  "loads": [
-    { "id": "load_1", "name": "F1", "node_ids": [8, 9], "direction": "x", "magnitude": 120 },
-    { "id": "load_2", "name": "F2", "node_ids": [10, 11], "direction": "z", "magnitude": -240 }
-  ]
-}
-```
-
-Each force item is written as its own `LOAD_SELECTION_n` node set and `*CLOAD` entry. Overlapping node sets are allowed; CalculiX naturally superposes the loads in the same static step.
-
-`mesh_preview.vtp` includes a `node_id` point-data array so the frontend can map VTK.js point picks back to CalculiX node IDs.
-
-`FileReference.path` values are logical workspace references such as:
-
-```text
-workspace/job_abcdef123456/results/result_surface_displacement.vtp
-```
-
-They are not browser URLs.
-
-## Controlled File API
-
-Generated files are exposed through:
-
-```text
-GET /api/files/{job_id}/{stage}/{filename}
-```
-
-Example:
-
-```text
-GET /api/files/job_abcdef123456/results/result_surface_displacement.vtp
-```
-
-Security rules:
-
-- `job_id` must match `job_[0-9a-f]{12}`.
-- `stage` must be one of `geometry`, `mesh`, `preprocess`, `solver`, or `results`.
-- `filename` must be a plain filename and must be included in that stage's allowlist.
-- The resolved path must remain inside `WORKSPACE_ROOT`.
-- Directory listing, absolute paths, `..`, and unlisted files are rejected.
-
-This keeps the existing workspace file contract while avoiding a raw static mount of the whole workspace directory.
-
-## Run Tests
-
-From the repository root:
+如果项目中存在测试目录，可从仓库根目录运行：
 
 ```powershell
 backend/.venv/Scripts/python.exe -m pytest -q
 ```
 
-Or from `backend` with uv:
+或在 `backend` 目录使用 uv：
 
 ```powershell
 uv run pytest ../test
 ```
 
-## Current Scope
+如果当前开源副本没有 `test/` 目录，上述命令会因为找不到测试而失败，这是预期情况。
 
-- Parameterized box geometry and STEP import.
-- Raw-first Gmsh volume mesh generation, geometry healing fallback, and surface-mesh fallback for display.
-- Task polling with typed logs for long mesh and solver operations.
-- Material, fixed node selection, and multiple load node selection persistence.
-- CalculiX input writing and solve execution.
-- FRD parsing/conversion to VTU/VTP result files.
-- Result summary and field APIs for displacement and Von Mises plots.
-- Controlled artifact download for frontend VTK.js rendering.
+## 常见排错
+
+- `GET /api/solver/plugins` 返回空列表：检查 `backend/app/plugins/` 是否存在插件目录和 `plugin.yaml`。
+- 插件加载时报 `Plugin entry file not found`：确认 `plugin.yaml` 的 `entry` 文件存在。
+- 插件加载时报 `Plugin class ... not found`：确认 `class` 字段与 `adapter.py` 中的类名完全一致。
+- 求解时报找不到 `ccx.exe`：检查插件 `executable` 路径，或设置 `CCX_EXECUTABLE`。
+- STEP 能显示但不能求解：当前几何可能只生成了表面网格，检查网格响应中的 `analysis_ready`。
